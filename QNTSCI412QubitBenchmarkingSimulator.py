@@ -11,8 +11,8 @@ SEED = 42
 rng = np.random.default_rng(SEED)
 
 #Global Parameters
-N_max = 100
-K = 50
+N_max = 10
+K = 5
 e_max = 0.05
 N_shots = 1024
 
@@ -113,6 +113,34 @@ CLIFFORD_LABEL_SET = clifford_labels()
 def clifford_names(G):
     return CLIFFORD_LABEL_SET.get(matrix_key(G), "C?")
 
+def nearest_clifford(U):
+    best_gate = None
+    best_dist = np.inf
+    phases = [1, -1, 1j, -1j,
+              (1+1j)/np.sqrt(2), (1-1j)/np.sqrt(2),
+              (-1+1j)/np.sqrt(2), (-1-1j)/np.sqrt(2)]
+    for gate in CLIFFORD_SET:
+        for phase in phases:
+            dist = np.linalg.norm(U - phase * gate, 'fro')
+            if dist < best_dist:
+                best_dist = dist
+                best_gate = gate
+    return best_gate
+
+
+def find_clifford_inverse(U_cumul):
+    """
+    Snap U_cumul to its nearest exact Clifford, then look up the inverse.
+    Returns (gate_matrix, gate_name).
+    """
+    # First snap to exact Clifford to remove any accumulated floating point error
+    U_exact = nearest_clifford(U_cumul)
+    U_inv = U_exact.conj().T
+    k = matrix_key(U_inv)
+    for gate in CLIFFORD_SET:
+        if matrix_key(gate) == k:
+            return gate, clifford_names(gate)
+    raise ValueError("Inverse not found in Clifford set")
 
 #Error Channel (Noise)
 def depolarize(rho, q):
@@ -124,6 +152,10 @@ def depolarize(rho, q):
     return noise
 
 #Noisy Clifford Sequence/Survival Probability Computation
+# Set to True to use single-gate lookup inversion,
+# set to False to use the original element-wise inversion
+USE_SINGLE_GATE_INVERSION = True
+
 def rb_sequence(n, e_max, rho_in):
     rho = rho_in.copy()
     U_cumul = I_2.copy()
@@ -140,12 +172,18 @@ def rb_sequence(n, e_max, rho_in):
         q = rng.uniform(0, e_max)
         rho = depolarize(rho, q)
 
-        U_cumul = G @ U_cumul
+        U_cumul = U_cumul @ G
 
-    C_inverse = U_cumul.conj().T
-    rho = C_inverse @ rho @ C_inverse.conj().T
-
-    gate_names.append(clifford_names(C_inverse))
+    if USE_SINGLE_GATE_INVERSION:
+        # Find the single Clifford gate that inverts the entire sequence
+        C_inverse, inv_name = find_clifford_inverse(U_cumul)
+        rho = C_inverse @ rho @ C_inverse.conj().T
+        gate_names.append(inv_name)
+    else:
+        # Original method: apply the conjugate transpose directly
+        C_inverse = U_cumul.conj().T
+        rho = C_inverse @ rho @ C_inverse.conj().T
+        gate_names.append(clifford_names(C_inverse))
 
     survival = np.real(np.trace(rho_0 @ rho))
     survival = float(np.clip(survival, 0.0, 1.0))
@@ -155,7 +193,6 @@ def rb_sequence(n, e_max, rho_in):
         survival = counts / N_shots
 
     return survival, gate_names
-
 #RB Loop Data Collection
 def collect_data(n_max, k, e_max, rho_in):
     lengths = np.arange(1, n_max + 1)
@@ -173,6 +210,7 @@ def collect_data(n_max, k, e_max, rho_in):
                 "sequence_length": int(n),
                 "run_index": run_idx,
                 "survival_probability": round(survival, 6),
+                "inversion_gate": gate_names[-1]
             }
 
             for gate_position, name in enumerate(gate_names, start = 1):
@@ -226,7 +264,7 @@ def export_gate_sequences(sequence_record, path):
     )
 
     gate_columns = [f"gate_{i}" for i in range(1, max_gates + 1)]
-    field_names = ["sequence_length", "run_index", "survival_probability"] + gate_columns
+    field_names = ["sequence_length", "run_index", "survival_probability", "inversion_gate"] + gate_columns
 
     with open(path, "w", newline = "") as fh:
         writer = csv.DictWriter(fh, fieldnames = field_names, extrasaction = "ignore")
