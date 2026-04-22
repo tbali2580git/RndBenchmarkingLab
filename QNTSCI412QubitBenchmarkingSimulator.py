@@ -11,8 +11,8 @@ SEED = 42
 rng = np.random.default_rng(SEED)
 
 #Global Parameters
-N_max = 10
-K = 5
+N_max = 100
+K = 50
 e_max = 0.05
 N_shots = 1024
 
@@ -127,18 +127,12 @@ def nearest_clifford(U):
                 best_gate = gate
     return best_gate
 
-
 def find_clifford_inverse(U_cumul):
-    """
-    Snap U_cumul to its nearest exact Clifford, then look up the inverse.
-    Returns (gate_matrix, gate_name).
-    """
-    # First snap to exact Clifford to remove any accumulated floating point error
     U_exact = nearest_clifford(U_cumul)
-    U_inv = U_exact.conj().T
-    k = matrix_key(U_inv)
     for gate in CLIFFORD_SET:
-        if matrix_key(gate) == k:
+        product = gate @ U_exact
+        if np.allclose(product, np.eye(2) * product[0,0], atol=1e-6) and \
+           abs(abs(product[0,0]) - 1.0) < 1e-6:
             return gate, clifford_names(gate)
     raise ValueError("Inverse not found in Clifford set")
 
@@ -154,7 +148,7 @@ def depolarize(rho, q):
 #Noisy Clifford Sequence/Survival Probability Computation
 # Set to True to use single-gate lookup inversion,
 # set to False to use the original element-wise inversion
-USE_SINGLE_GATE_INVERSION = True
+USE_SINGLE_GATE_INVERSION = False
 
 def rb_sequence(n, e_max, rho_in):
     rho = rho_in.copy()
@@ -172,18 +166,23 @@ def rb_sequence(n, e_max, rho_in):
         q = rng.uniform(0, e_max)
         rho = depolarize(rho, q)
 
-        U_cumul = U_cumul @ G
+        U_cumul = G @ U_cumul
+
+    # Both branches use find_clifford_inverse to get a clean exact matrix.
+    # The switch only controls what label gets written to the CSV.
+    C_inverse, inv_name = find_clifford_inverse(U_cumul)
 
     if USE_SINGLE_GATE_INVERSION:
-        # Find the single Clifford gate that inverts the entire sequence
-        C_inverse, inv_name = find_clifford_inverse(U_cumul)
+        # Label is the single recovery gate name
         rho = C_inverse @ rho @ C_inverse.conj().T
         gate_names.append(inv_name)
     else:
-        # Original method: apply the conjugate transpose directly
-        C_inverse = U_cumul.conj().T
+        # Label is the same recovery gate name — the mathematical operation
+        # is identical since U_cumul† is always a single Clifford regardless.
+        # The semantic difference is just conceptual: False means you think of
+        # it as "reverse each gate", True means "one lookup gate".
         rho = C_inverse @ rho @ C_inverse.conj().T
-        gate_names.append(clifford_names(C_inverse))
+        gate_names.append(inv_name)
 
     survival = np.real(np.trace(rho_0 @ rho))
     survival = float(np.clip(survival, 0.0, 1.0))
