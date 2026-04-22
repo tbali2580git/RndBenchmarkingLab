@@ -11,10 +11,13 @@ SEED = 42
 rng = np.random.default_rng(SEED)
 
 #Global Parameters
-N_max = 100
-K = 50
+N_max = 150
+K = 100
 e_max = 0.05
 N_shots = 1024
+mu = 0.005
+sigma = 0.001
+
 
 #Outputs
 CSV_path = "rb_sequences.csv"
@@ -38,8 +41,13 @@ def u(theta, n_x, n_y, n_z):
 
 def matrix_key(U):
     flat = U.flatten()
-    idx = np.argmax(np.abs(flat))
-    phase = flat[idx] / abs(flat[idx])
+    # Find first element with non-negligible magnitude
+    for val in flat:
+        if abs(val) > 1e-9:
+            phase = val / abs(val)
+            break
+    else:
+        phase = 1.0
     canonical = (U / phase).round(6)
     return tuple(canonical.real.flatten()) + tuple(canonical.imag.flatten())
 
@@ -113,22 +121,16 @@ CLIFFORD_LABEL_SET = clifford_labels()
 def clifford_names(G):
     return CLIFFORD_LABEL_SET.get(matrix_key(G), "C?")
 
-def nearest_clifford(U):
-    best_gate = None
-    best_dist = np.inf
-    phases = [1, -1, 1j, -1j,
-              (1+1j)/np.sqrt(2), (1-1j)/np.sqrt(2),
-              (-1+1j)/np.sqrt(2), (-1-1j)/np.sqrt(2)]
-    for gate in CLIFFORD_SET:
-        for phase in phases:
-            dist = np.linalg.norm(U - phase * gate, 'fro')
-            if dist < best_dist:
-                best_dist = dist
-                best_gate = gate
-    return best_gate
 
 def find_clifford_inverse(U_cumul):
-    U_exact = nearest_clifford(U_cumul)
+    k = matrix_key(U_cumul)
+    U_exact = None
+    for gate in CLIFFORD_SET:
+        if matrix_key(gate) == k:
+            U_exact = gate
+            break
+    if U_exact is None:
+        raise ValueError("U_cumul is not in the Clifford set — numerical drift?")
     for gate in CLIFFORD_SET:
         product = gate @ U_exact
         if np.allclose(product, np.eye(2) * product[0,0], atol=1e-6) and \
@@ -148,41 +150,26 @@ def depolarize(rho, q):
 #Noisy Clifford Sequence/Survival Probability Computation
 # Set to True to use single-gate lookup inversion,
 # set to False to use the original element-wise inversion
-USE_SINGLE_GATE_INVERSION = False
 
 def rb_sequence(n, e_max, rho_in):
     rho = rho_in.copy()
-    U_cumul = I_2.copy()
-    gate_names = []
+    gate_sequence = []  # stores exact Clifford matrices, no drift
 
     for _ in range(n):
         idx = rng.integers(NUM_CLIFFORDS)
         G = CLIFFORD_SET[idx]
-
-        gate_names.append(clifford_names(G))
-
+        gate_sequence.append(G)
         rho = G @ rho @ G.conj().T
-
-        q = rng.uniform(0, e_max)
+        q = float(np.clip(rng.normal(mu, sigma), 0, None))
         rho = depolarize(rho, q)
 
+    # Compute U_cumul from the stored ideal gates — no drift possible
+    U_cumul = I_2.copy()
+    for G in gate_sequence:
         U_cumul = G @ U_cumul
 
-    # Both branches use find_clifford_inverse to get a clean exact matrix.
-    # The switch only controls what label gets written to the CSV.
     C_inverse, inv_name = find_clifford_inverse(U_cumul)
-
-    if USE_SINGLE_GATE_INVERSION:
-        # Label is the single recovery gate name
-        rho = C_inverse @ rho @ C_inverse.conj().T
-        gate_names.append(inv_name)
-    else:
-        # Label is the same recovery gate name — the mathematical operation
-        # is identical since U_cumul† is always a single Clifford regardless.
-        # The semantic difference is just conceptual: False means you think of
-        # it as "reverse each gate", True means "one lookup gate".
-        rho = C_inverse @ rho @ C_inverse.conj().T
-        gate_names.append(inv_name)
+    rho = C_inverse @ rho @ C_inverse.conj().T
 
     survival = np.real(np.trace(rho_0 @ rho))
     survival = float(np.clip(survival, 0.0, 1.0))
@@ -191,7 +178,9 @@ def rb_sequence(n, e_max, rho_in):
         counts = rng.binomial(N_shots, survival)
         survival = counts / N_shots
 
-    return survival, gate_names
+    gate_names = [clifford_names(G) for G in gate_sequence]
+    return survival, gate_names, inv_name
+
 #RB Loop Data Collection
 def collect_data(n_max, k, e_max, rho_in):
     lengths = np.arange(1, n_max + 1)
@@ -202,26 +191,25 @@ def collect_data(n_max, k, e_max, rho_in):
     for i, n in enumerate(lengths):
         survivals = []
         for run_idx in range(k):
-            survival, gate_names = rb_sequence(n, e_max, rho_in)
+            survival, gate_names, inv_name = rb_sequence(n, e_max, rho_in)
             survivals.append(survival)
 
             record = {
                 "sequence_length": int(n),
                 "run_index": run_idx,
                 "survival_probability": round(survival, 6),
-                "inversion_gate": gate_names[-1]
+                "inversion_gate": inv_name
             }
-
-            for gate_position, name in enumerate(gate_names, start = 1):
+            for gate_position, name in enumerate(gate_names, start=1):
                 record[f"gate_{gate_position}"] = name
-            
+
             sequence_record.append(record)
-        
+
         p_avg[i] = np.mean(survivals)
-        p_std[i] = np.std(survivals, ddof = 1)
+        p_std[i] = np.std(survivals, ddof=1)
         if (i + 1) % 10 == 0 or n == n_max:
             print(f" n = {n:3d} P_avg = {p_avg[i]:.4f} +- {p_std[i]:.4f}")
-    
+
     return lengths, p_avg, p_std, sequence_record
 
 #Exponential Fit Functionality
