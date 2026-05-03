@@ -11,16 +11,33 @@ SEED = 42
 rng = np.random.default_rng(SEED)
 
 #Global Parameters
-N_max = 150
+N_max = 100
 K = 100
+K_IRB = 200  # more sequences for IRB to tighten the bound
 e_max = 0.05
 N_shots = 1024
 mu = 0.005
 sigma = 0.001
 
+# Per-gate depolarizing noise parameters (mu, sigma)
+# Physically motivated: pi gates noisier than pi/2, virtual gates near-zero
+# Tripathi Section 4.4 notes ~80% pi/2 and ~20% pi in a typical Clifford set
+GATE_NOISE_TABLE = {
+    "I":   (0.001, 0.0002),   # virtual — essentially free
+    "X":   (0.015, 0.002),    # pi pulse
+    "Y":   (0.015, 0.002),    # pi pulse
+    "Z":   (0.001, 0.0002),   # virtual gate
+    "H":   (0.008, 0.001),    # pi/2 + pi/2 decomposition
+    "S":   (0.006, 0.001),    # pi/2 pulse
+    "Sd":  (0.006, 0.001),    # pi/2 pulse
+}
+GATE_NOISE_DEFAULT_MU    = 0.010  # for remaining 17 Cliffords (multi-pulse)
+GATE_NOISE_DEFAULT_SIGMA = 0.002
+
 
 #Outputs
 CSV_path = "rb_sequences.csv"
+IRB_CSV_path = "irb_sequences.csv"
 
 #Pauli Matrices Creation
 I_2 = np.eye(2, dtype = complex)
@@ -75,6 +92,7 @@ def clifford_group():
 
 CLIFFORD_SET = clifford_group()
 NUM_CLIFFORDS = len(CLIFFORD_SET)
+
 
 #Label Mapping To Each Clifford Gate
 def clifford_labels():
@@ -153,17 +171,18 @@ def depolarize(rho, q):
 
 def rb_sequence(n, e_max, rho_in):
     rho = rho_in.copy()
-    gate_sequence = []  # stores exact Clifford matrices, no drift
+    gate_sequence = []
 
     for _ in range(n):
         idx = rng.integers(NUM_CLIFFORDS)
         G = CLIFFORD_SET[idx]
         gate_sequence.append(G)
         rho = G @ rho @ G.conj().T
+
+        # Gate-independent depolarizing noise (standard RB, Tripathi Eq. 7)
         q = float(np.clip(rng.normal(mu, sigma), 0, None))
         rho = depolarize(rho, q)
 
-    # Compute U_cumul from the stored ideal gates — no drift possible
     U_cumul = I_2.copy()
     for G in gate_sequence:
         U_cumul = G @ U_cumul
@@ -181,13 +200,19 @@ def rb_sequence(n, e_max, rho_in):
     gate_names = [clifford_names(G) for G in gate_sequence]
     return survival, gate_names, inv_name
 
+
 #Interleaved RB Sequence
 def irb_sequence(n, e_max, rho_in, target_gate):
     rho = rho_in.copy()
     gate_sequence = []
 
+    target_label = clifford_names(target_gate)
+    target_mu, target_sigma = GATE_NOISE_TABLE.get(
+        target_label, (GATE_NOISE_DEFAULT_MU, GATE_NOISE_DEFAULT_SIGMA)
+    )
+
     for _ in range(n):
-        # Random Clifford
+        # Random Clifford — same gate-independent noise as standard RB
         idx = rng.integers(NUM_CLIFFORDS)
         G = CLIFFORD_SET[idx]
         gate_sequence.append(G)
@@ -195,13 +220,12 @@ def irb_sequence(n, e_max, rho_in, target_gate):
         q = float(np.clip(rng.normal(mu, sigma), 0, None))
         rho = depolarize(rho, q)
 
-        # Interleaved target gate
+        # Target gate — gate-specific noise from table
         gate_sequence.append(target_gate)
         rho = target_gate @ rho @ target_gate.conj().T
-        q = float(np.clip(rng.normal(mu, sigma), 0, None))
+        q = float(np.clip(rng.normal(target_mu, target_sigma), 0, None))
         rho = depolarize(rho, q)
 
-    # Inversion computed from full ideal sequence including target gates
     U_cumul = I_2.copy()
     for G in gate_sequence:
         U_cumul = G @ U_cumul
@@ -254,18 +278,30 @@ def collect_irb_data(n_max, k, e_max, rho_in, target_gate):
     lengths = np.arange(1, n_max + 1)
     p_avg = np.zeros(n_max)
     p_std = np.zeros(n_max)
+    sequence_record = []
 
     for i, n in enumerate(lengths):
         survivals = []
-        for _ in range(k):
-            survival, _, _ = irb_sequence(n, e_max, rho_in, target_gate)
+        for run_idx in range(k):
+            survival, gate_names, inv_name = irb_sequence(n, e_max, rho_in, target_gate)
             survivals.append(survival)
+
+            record = {
+                "sequence_length": int(n),
+                "run_index": run_idx,
+                "survival_probability": round(survival, 6),
+                "inversion_gate": inv_name
+            }
+            for gate_position, name in enumerate(gate_names, start=1):
+                record[f"gate_{gate_position}"] = name
+            sequence_record.append(record)
+
         p_avg[i] = np.mean(survivals)
         p_std[i] = np.std(survivals, ddof=1)
         if (i + 1) % 10 == 0 or n == n_max:
             print(f" [IRB] n = {n:3d} P_avg = {p_avg[i]:.4f} +- {p_std[i]:.4f}")
 
-    return lengths, p_avg, p_std
+    return lengths, p_avg, p_std, sequence_record  # ← now returned
 
 #Exponential Fit Functionality
 def rb_mod(n, A, p, B):
@@ -274,13 +310,13 @@ def rb_mod(n, A, p, B):
 def fit_rb_func(lengths, p_avg, p_std):
     p_0 = [0.5, 0.9, 0.5]
     bounds = ([0, 0, 0], [1, 1, 1])
-    sigma = p_std if np.all(p_std > 0) else None
+    fit_sigma = p_std if np.all(p_std > 0) else None
     
     try:
         popt, pcov = curve_fit(
             rb_mod, lengths, p_avg,
             p0 = p_0, bounds = bounds,
-            sigma = sigma, absolute_sigma = True,
+            sigma = fit_sigma, absolute_sigma = True,
             maxfev = 10000
         )
     except RuntimeError as e:
@@ -372,10 +408,9 @@ def plot_rb(lengths, p_avg, p_std, popt, r_C, e_max, save_path = None):
 
     ax.set_xlabel("Sequence Length $n$")
     ax.set_ylabel("Survival Probability $P_{avg}(n)$")
-    ax.set_title(
-        f"Single Qubit Randomized Benchmarking Simulation \n"
-        f"$\\epsilon_{{max}} = {e_max}$, $K = {K}$, shots / sequence = {N_shots if N_shots else 'inf'}",
-        color = "white"
+    ax.set_title(f"Single Qubit Randomized Benchmarking Simulation \n"
+    f"$\\mu = {mu}$, $\\sigma = {sigma}$, $K = {K}$, shots / sequence = {N_shots if N_shots else 'inf'}",
+    color = "white"
     )
 
     ax.tick_params(colors = "white")
@@ -393,62 +428,53 @@ def plot_rb(lengths, p_avg, p_std, popt, r_C, e_max, save_path = None):
     
     plt.show()
 
-def plot_irb_all(lengths, p_avg_rb, p_std_rb, popt_rb,
-                 irb_results, r_C, e_max, save_path=None):
-    """
-    irb_results: list of dicts with keys:
-        'gate_name', 'p_avg', 'p_std', 'popt', 'r_gate'
-    """
+def plot_irb_single(lengths, p_avg_rb, p_std_rb, popt_rb,
+                    lengths_irb, p_avg_irb, p_std_irb, popt_irb,
+                    r_C, r_gate, target_name, e_max, save_path=None):
     A_rb, p_rb, B_rb = popt_rb
+    A_irb, p_irb, B_irb = popt_irb
     n_fine = np.linspace(1, lengths[-1], 400)
 
-    fig, ax = plt.subplots(figsize=(14, 10))
+    fig, ax = plt.subplots(figsize=(10, 10))
     fig.patch.set_facecolor("green")
     ax.set_facecolor("green")
 
-    # Plot standard RB data and fit
     ax.errorbar(lengths, p_avg_rb, yerr=p_std_rb,
-                fmt="o", color="white", markersize=4,
+                fmt="o", color="red", markersize=4,
                 elinewidth=0.8, capsize=3, capthick=0.8,
-                label=f"Standard RB ($r_C = {r_C*100:.3f}$%)", zorder=5)
+                label=f"Standard RB ($r_C = {r_C*100:.3f}$%)", zorder=4)
     ax.plot(n_fine, rb_mod(n_fine, A_rb, p_rb, B_rb),
-            color="white", linewidth=2.5, zorder=5)
+            color="yellow", linewidth=2,
+            label=f"RB fit: $p = {p_rb:.5f}$", zorder=4)
 
-    # Use a colormap to distinguish 24 gates
-    cmap = plt.cm.get_cmap("hsv", len(irb_results) + 1)
+    ax.errorbar(lengths_irb, p_avg_irb, yerr=p_std_irb,
+                fmt="s", color="cyan", markersize=4,
+                elinewidth=0.8, capsize=3, capthick=0.8,
+                label=f"IRB — {target_name} ($r_G = {r_gate*100:.3f}$%)", zorder=4)
+    ax.plot(n_fine, rb_mod(n_fine, A_irb, p_irb, B_irb),
+            color="magenta", linewidth=2, linestyle="--",
+            label=f"IRB fit: $p_{{inter}} = {p_irb:.5f}$", zorder=4)
 
-    for idx, result in enumerate(irb_results):
-        color = cmap(idx)
-        A_i, p_i, B_i = result["popt"]
-        ax.plot(n_fine, rb_mod(n_fine, A_i, p_i, B_i),
-                color=color, linewidth=1.2, linestyle="--",
-                label=f"{result['gate_name']}: $r_G = {result['r_gate']*100:.3f}$%",
-                zorder=3)
-
-    ax.set_xlabel("Sequence Length $n$", color="white")
-    ax.set_ylabel("Survival Probability $P_{avg}(n)$", color="white")
+    ax.set_xlabel("Sequence Length $n$")
+    ax.set_ylabel("Survival Probability $P_{avg}(n)$")
     ax.set_title(
-        f"Single Qubit IRB — All 24 Clifford Gates\n"
-        f"$K = {K}$, shots = {N_shots}, $\\mu = {mu}$, $\\sigma = {sigma}$",
+        f"Standard RB vs Interleaved RB — Gate: {target_name}\n"
+        f"$K = {K}$, shots = {N_shots}, per-gate depolarizing noise",
         color="white"
     )
     ax.tick_params(colors="white")
     for spine in ax.spines.values():
         spine.set_edgecolor("purple")
-    ax.grid(True, linestyle="--", alpha=0.4)
+    ax.grid(True, linestyle="--")
     ax.set_xlim(0, lengths[-1] + 1)
     ax.set_ylim(-0.02, 1.05)
-
-    legend = ax.legend(
-        facecolor="black", edgecolor="purple", labelcolor="white",
-        loc="upper right", fontsize=7, ncol=2
-    )
+    ax.legend(facecolor="blue", edgecolor="blue", labelcolor="white", loc="upper right")
 
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches="tight",
                     facecolor=fig.get_facecolor())
-        print(f"\nIRB all-gates plot saved to {save_path}")
+        print(f"\nPlot saved to {save_path}")
     plt.show()
 
 def main():
@@ -457,7 +483,7 @@ def main():
     print(f"Initial State: |0>")
     print(f"Max Sequence Length: {N_max}")
     print(f"Sequences / Length: {K}")
-    print(f"Max Gate Error: {e_max}")
+    print(f"RB Noise: mu = {mu}, sigma = {sigma}")
     print(f"Measurement Shots: {N_shots if N_shots else 'exact (inf)'}")
 
     # --- Standard RB ---
@@ -479,17 +505,28 @@ def main():
     plot_rb(lengths, p_avg, p_std, popt_rb, r_C, e_max,
             save_path="rb_single_qubit.png")
 
-    # --- Interleaved RB: all 24 Clifford gates ---
-    print("\n--- Interleaved RB: all 24 Clifford gates ---")
-    irb_results = []
+# --- Interleaved RB: user-selected target gate ---
+    # Choose from any gate name in CLIFFORD_LABEL_SET, e.g.:
+    # "I", "X", "Y", "Z", "H", "S", "Sd"
+    # or signature names like "+X+Z-Y", "-Y+Z-X", etc.
+    # Run print(set(CLIFFORD_LABEL_SET.values())) to see all 24 names
+    TARGET_GATE_NAME = "X"
 
-    for gate_idx, target_gate in enumerate(CLIFFORD_SET):
-        target_name = clifford_names(target_gate)
-        print(f"\n[{gate_idx+1:2d}/24] Gate: {target_name}")
+    # Resolve name to matrix
+    name_to_mat = {}
+    for gate in CLIFFORD_SET:
+        label = CLIFFORD_LABEL_SET[matrix_key(gate)]
+        name_to_mat[label] = gate
+    if TARGET_GATE_NAME not in name_to_mat:
+        print(f"\nUnknown gate '{TARGET_GATE_NAME}'. Available gates:")
+        print(sorted(set(CLIFFORD_LABEL_SET.values())))
+    else:
+        target_gate = name_to_mat[TARGET_GATE_NAME]
+        print(f"\n--- Interleaved RB (target gate: {TARGET_GATE_NAME}) ---")
 
-        lengths_irb, p_avg_irb, p_std_irb = collect_irb_data(
-            N_max, K, e_max, rho_0, target_gate
-        )
+        lengths_irb, p_avg_irb, p_std_irb, irb_sequence_record = collect_irb_data(N_max, K_IRB, e_max, rho_0, target_gate)
+        export_gate_sequences(irb_sequence_record, IRB_CSV_path)
+        
         popt_irb, pcov_irb = fit_rb_func(lengths_irb, p_avg_irb, p_std_irb)
         A_irb, p_irb, B_irb = popt_irb
         perr_irb = (np.sqrt(np.diag(pcov_irb))
@@ -500,36 +537,18 @@ def main():
         E = irb_error_bound(p_rb, p_irb)
         r_gate_err = perr_irb[1] / (2 * p_rb)
 
-        print(f"  p_inter = {p_irb:.5f} +- {perr_irb[1]:.5f}")
-        print(f"  r_G     = {r_gate*100:.4f}% +- {r_gate_err*100:.4f}%")
-        print(f"  E bound = {E*100:.4f}%  =>  "
-              f"r_G in [{(r_gate-E)*100:.4f}%, {(r_gate+E)*100:.4f}%]")
+        print(f"p_inter = {p_irb:.5f} +- {perr_irb[1]:.5f}")
+        print(f"r_G     = {r_gate*100:.4f}% +- {r_gate_err*100:.4f}%")
+        r_G_lower = max(r_gate - E, 0.0)
+        r_G_upper = min(r_gate + E, 1.0)
+        flag = " [lower bound clamped]" if r_gate <= E else ""
+        print(f"E bound = {E*100:.4f}%  =>  "
+              f"r_G in [{r_G_lower*100:.4f}%, {r_G_upper*100:.4f}%]{flag}")
 
-        irb_results.append({
-            "gate_name": target_name,
-            "p_avg":     p_avg_irb,
-            "p_std":     p_std_irb,
-            "popt":      popt_irb,
-            "r_gate":    r_gate,
-            "r_gate_err": r_gate_err,
-            "E":         E,
-        })
-
-    # Summary table
-    print("\n--- IRB Summary: All 24 Clifford Gates ---")
-    print(f"{'Gate':<20} {'r_G (%)':>10} {'+/- (%)':>10} {'E bound (%)':>12}")
-    print("-" * 56)
-    for result in irb_results:
-        print(f"{result['gate_name']:<20} "
-              f"{result['r_gate']*100:>10.4f} "
-              f"{result['r_gate_err']*100:>10.4f} "
-              f"{result['E']*100:>12.4f}")
-
-    plot_irb_all(lengths, p_avg, p_std, popt_rb,
-                 irb_results, r_C, e_max,
-                 save_path="irb_all_gates.png")
-
-
+        plot_irb_single(lengths, p_avg, p_std, popt_rb,
+                        lengths_irb, p_avg_irb, p_std_irb, popt_irb,
+                        r_C, r_gate, TARGET_GATE_NAME, e_max,
+                        save_path=f"irb_{TARGET_GATE_NAME}.png")
 
 #Run Main
 if __name__ == "__main__":
