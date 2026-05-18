@@ -19,6 +19,7 @@ N_shots = 1024
 mu = 0.005
 sigma = 0.001
 
+
 # Per-gate depolarizing noise parameters (mu, sigma)
 # Physically motivated: pi gates noisier than pi/2, virtual gates near-zero
 # Tripathi Section 4.4 notes ~80% pi/2 and ~20% pi in a typical Clifford set
@@ -33,6 +34,16 @@ GATE_NOISE_TABLE = {
 }
 GATE_NOISE_DEFAULT_MU    = 0.010  # for remaining 17 Cliffords (multi-pulse)
 GATE_NOISE_DEFAULT_SIGMA = 0.002
+
+# DB Parameters (from Tripathi Paper)
+DB_gate_time = 88e-9
+DB_T1 = 23.36e-6
+DB_T2 = 44.13e-6
+DB_d_theta = np.radians(0.398)
+DB_d_phi = np.radians(0.426)
+
+DB_Num_repeats = 800
+DB_shots = 1024
 
 
 #Outputs
@@ -49,7 +60,10 @@ PAULISET  = [X, Y, Z]
 #State Vectors/Density Matrices
 ket_0 = np.array([1, 0], dtype = complex) # |0>
 ket_1 = np.array([0, 1], dtype = complex) # |1>
+ket_p = np.array([1, 1], dtype = complex) / np.sqrt(2) # |+>
 rho_0 = np.outer(ket_0, ket_0.conj()) # |0><0|
+rho_1 = np.outer(ket_1, ket_1.conj()) # |1><1|
+rho_p = np.outer(ket_p, ket_p.conj()) # |+><+|
 
 #Single-Qubit Clifford Group Functions
 def u(theta, n_x, n_y, n_z):
@@ -371,7 +385,301 @@ def export_gate_sequences(sequence_record, path):
     print(f"  [CSV] Gate_1 … gate_<m> are random Clifford gates; "
           f"gate_<m+1> is the recovery gate.")
     
+# DB Simulator
+def _Rx(theta):
+    c, s = np.cos(theta / 2), np.sin(theta / 2)
+    return np.array([[c, -1j * s], [-1j * s, c]], dtype = complex)
 
+def _Ry(theta):
+    c, s = np.cos(theta / 2), np.sin(theta / 2)
+    return np.array([[c, -s], [s, c]], dtype = complex)
+
+def _Rz(phi):
+    return np.array([[np.exp(-1j * phi / 2), 0], [0, np.exp(1j * phi / 2)]], dtype = complex)
+
+def noise_gate(best_angle: float, axis: str, d_theta: float, d_phi: float) -> np.ndarray:
+    if axis == 'x':
+        R = _Rx(best_angle + d_theta)
+    elif axis == 'y':
+        R = _Ry(best_angle + d_theta)
+    else:
+        raise ValueError(f"Unknown axis: {axis}")
+    return R @ _Rz(d_phi)    # was: _Rz(d_phi) @ R
+
+def db_gates_construct(d_theta: float, d_phi: float):
+    X_plus = noise_gate(+np.pi, 'x', d_theta, d_phi)
+    X_minus = noise_gate(-np.pi, 'x', -d_theta, -d_phi)
+    Y_plus = noise_gate(+np.pi, 'y', d_theta, d_phi)
+    Y_minus = noise_gate(-np.pi, 'y', -d_theta, -d_phi)
+
+    return {
+        "XX": (X_plus, X_plus),
+        "XXd": (X_plus, X_minus),
+        "YY": (Y_plus, Y_plus),
+        "YYd": (Y_plus, Y_minus),
+        "YYdY": (Y_minus, Y_plus)
+    }
+
+# Lindblad Theory
+def _vec(rho: np.ndarray) -> np.ndarray:
+    return rho.flatten(order = 'F')
+
+def _unvec(v: np.ndarray) -> np.ndarray:
+    return v.reshape(2, 2, order = 'F')
+
+def _superoperator_commutator(H: np.ndarray) -> np.ndarray:
+    I = np.eye(2, dtype = complex)
+    out = -1j * (np.kron(I, H) - np.kron(H.T, I))
+    return out
+
+def _superoperator_lindblad(L: np.ndarray) -> np.ndarray:
+    I = np.eye(2, dtype = complex)
+    LdL = L.conj().T @ L
+    out = (np.kron(L.conj(), L) - 0.5 * np.kron(I, LdL) - 0.5 * np.kron(LdL.T, I))
+    return out
+
+def free_evol_prop(dt: float, T_1: float, T_2: float) -> np.ndarray:
+    gamma_1 = 1.0 / T_1
+    T_phi = 2 * T_1 * T_2 / max(2 * T_1 - T_2, 1e-30)
+    gamma_phi = 1.0 / T_phi
+
+    sigma_minus = np.array([[0, 1], [0, 0]], dtype = complex)
+    sigma_z = np.array([[1, 0], [0, -1]], dtype = complex)
+
+    Lindblad_tot = (_superoperator_lindblad(sigma_minus) * gamma_1 + _superoperator_lindblad(sigma_z / np.sqrt(2)) * gamma_phi)
+
+    from scipy.linalg import expm
+    out = expm(Lindblad_tot * dt)
+    return out
+
+def gate_propagator(U: np.ndarray, dt: float, T_1: float, T_2: float) -> np.ndarray:
+    U_sup = np.kron(U.conj(), U)
+    E_open = free_evol_prop(dt, T_1, T_2)
+    out = E_open @ U_sup
+    return out
+
+# Fidelity Simulator
+def db_simulate_sequence(gate_pair: tuple, rho_init: np.ndarray, num_reps: int, t_g: float, T_1: float, T_2: float, shots: int = 0) -> np.ndarray:
+    U_1, U_2 = gate_pair
+    E_1 = gate_propagator(U_1, t_g, T_1, T_2)
+    E_2 = gate_propagator(U_2, t_g, T_1, T_2)
+
+    E_pair = E_2 @ E_1
+
+    rho_vector = _vec(rho_init)
+    rho_measured = _vec(rho_init).conj()
+
+    fidelities = np.zeros(num_reps)
+    rho_present = rho_vector.copy()
+
+    for n in range(num_reps):
+        rho_present = E_pair @ rho_present
+        rho_d_m = _unvec(rho_present)
+        F = float(np.real(np.trace(rho_init @ rho_d_m)))
+        F = np.clip(F, 0.0, 1.0)
+
+        if shots > 0:
+            F = rng.binomial(shots, F) / shots
+        
+        fidelities[n] = F
+    
+    return fidelities
+
+def db_simulate_T_1(num_points: int, t_g: float, T_1: float, T_2: float, shots: int = 0) -> tuple:
+    from scipy.linalg import expm
+    
+    E_free = free_evol_prop(t_g, T_1, T_2)
+    rho_vector = _vec(rho_1)
+    measure_d_m = rho_1
+
+    fidelities = np.zeros(num_points)
+    rho_present = rho_vector.copy()
+
+    for n in range(num_points):
+        rho_present = E_free @ rho_present
+        rho_d_m = _unvec(rho_present)
+        F = float(np.real(np.trace(measure_d_m @ rho_d_m)))
+        F = np.clip(F, 0.0, 1.0)
+
+        if shots > 0:
+            F = rng.binomial(shots, F) / shots
+        
+        fidelities[n] = F
+
+    times = np.arange(1, num_points + 1) * t_g
+    return times, fidelities
+
+# DB Phenomenological Fit
+def db_fidelity(t, a, T_D, omega):
+    out = 0.5 * (1 + a) + 0.5 * (1 - a) * np.exp(-t / T_D) * np.cos(2 * omega * t)
+    return out
+
+def db_t_1_model(t, T_1, a):
+    out = 0.5 * (1 + a) + 0.5 * (1 - a) * np.exp(-t / T_1)
+    return out
+
+def fit_db_sequence(times: np.ndarray, fidelities: np.ndarray, fix_omega: bool = False, omega_predict: float = 0.0, label: str = "") -> dict:
+    if fix_omega:
+        def model(t, a, T_D):
+            out = db_fidelity(t, a, T_D, 0.0)
+            return out
+        p_0 = [0.0, times[-1] / 3]
+        bounds = ([-1, 1e-12], [1, np.inf])
+        try:
+            popt, pcov = curve_fit(model, times, fidelities, p0 = p_0, bounds = bounds, maxfev = 20000)
+            perr = np.sqrt(np.diag(pcov))
+            out = dict(a = popt[0], T_D = popt[1], omega = 0.0, a_err = perr[0], T_D_err = perr[1], omega_err = 0.0, label = label)
+            return out
+        except Exception as e:
+            print(f" DB fit failed: {e}")
+            out = dict(a = 0.0, T_D = np.nan, omega = 0.0, a_err = np.nan, T_D_err = np.nan, omega_err = np.nan, label = label)
+            return out
+        
+    else:
+        d_c = np.mean(fidelities)
+        residual = fidelities - d_c
+        if np.max(np.abs(residual)) > 1e-6:
+            frequencies = np.fft.rfftfreq(len(times), d = (times[1] - times[0]))
+            spectrum = np.abs(np.fft.rfft(residual))
+            omega_fft = 2 * np.pi * frequencies[np.argmax(spectrum[1:]) + 1]
+        else:
+            omega_fft = 0.0
+        
+        if omega_predict > 0 and (omega_fft == 0.0 or abs(omega_fft - omega_predict) > 2 * omega_predict):
+            omega_init = omega_predict
+        else:
+            omega_init = omega_fft if omega_fft > 0 else 1.0
+        
+        p_0 = [0.0, times[-1] / 3, omega_init]
+        bounds = ([-1, 1e-12, 0.0], [1, np.inf, np.inf])
+
+        try:
+            popt, pcov = curve_fit(db_fidelity, times, fidelities, p0 = p_0, bounds = bounds, maxfev = 50000)
+            perr = np.sqrt(np.diag(pcov))
+            out = dict(a = popt[0], T_D = popt[1], omega = popt[2], a_err = perr[0], T_D_err = perr[1], omega_err = perr[2], label = label)
+            return out
+        except Exception as e:
+            print(f"DB Fit Failed: {e}")
+            out = dict(a = 0.0, T_D = np.nan, omega = np.nan, a_err = np.nan, T_D_err = np.nan, omega_err = np.nan, label = label)
+            return out
+
+# DB Parameter Extraction
+def db_extract(fit_T_1: dict, fit_XX: dict, fit_YY: dict, fit_XXd: dict, t_g: float) -> dict:
+    T_1 = fit_T_1["T_D"]
+    T_2 = fit_XX["T_D"]
+    d_theta = 2 * fit_YY["omega"] * t_g
+    d_phi = fit_XXd["omega"] * 2 * t_g
+
+    denominator = max(2 * T_1 - T_2, 1e-30)
+    T_phi = 2 * T_1 * T_2 / denominator
+
+    out = dict(T1 = T_1, T2 = T_2, Tphi = T_phi, delta_theta = d_theta, delta_phi = d_phi)
+    return out
+
+def compute_lindblad_fidelity(times, propagators, rho_init, measure_state):
+    E_step = np.eye(4, dtype=complex)
+    for E in propagators:
+        E_step = E @ E_step
+ 
+    rho_vec = _vec(rho_init)
+    fidelities = np.zeros(len(times))
+ 
+    rho_current = rho_vec.copy()
+    for i in range(len(times)):
+        rho_current = E_step @ rho_current
+        rho_dm = _unvec(rho_current)
+        F = float(np.real(np.trace(measure_state @ rho_dm)))
+        fidelities[i] = float(np.clip(F, 0.0, 1.0))
+ 
+    return fidelities
+ 
+
+# Run DB
+def run_db(T_1: float = DB_T1, T_2: float = DB_T2, t_g: float = DB_gate_time, d_theta: float = DB_d_theta, d_phi: float = DB_d_phi, num_reps: int = DB_Num_repeats, shots: int = DB_shots) -> dict:
+    print("  DETERMINISTIC BENCHMARKING  (Tripathi et al. 2025 §4)")
+    print("═" * 60)
+    print(f"  T1          = {T_1 * 1e6:.2f} µs")
+    print(f"  T2          = {T_2 * 1e6:.2f} µs")
+    print(f"  δθ (input)  = {np.degrees(d_theta):.4f}°")
+    print(f"  δφ (input)  = {np.degrees(d_phi):.4f}°")
+    print(f"  t_g         = {t_g * 1e9:.1f} ns")
+    print(f"  n_reps      = {num_reps}")
+    print(f"  shots       = {shots}")
+    print()
+
+    gates = db_gates_construct(d_theta, d_phi)
+    n_arr = np.arange(1, num_reps + 1)
+    times = n_arr * 2 * t_g
+
+    print("  [Step 1] Free evolution |1⟩ → T1")
+    t1_times, f_T1 = db_simulate_T_1(num_reps, t_g, T_1, T_2, shots=shots)
+    fit_t1 = fit_db_sequence(t1_times, f_T1, fix_omega=True, label="T1/free")
+    print(f"           T1 fit = {fit_t1['T_D'] * 1e6:.2f} µs  "
+          f"(input {T_1 * 1e6:.2f} µs)")
+    
+    print("  [Step 2] XX;|+⟩ → T2  (insensitive to coherent errors)")
+    f_XX = db_simulate_sequence(gates["XX"], rho_p, num_reps, t_g, T_1, T_2, shots)
+    fit_XX = fit_db_sequence(times, f_XX, fix_omega=True, label="XX")
+    print(f"           T2 fit = {fit_XX['T_D'] * 1e6:.2f} µs  "
+          f"(input {T_2 * 1e6:.2f} µs)")
+    
+    print("  [Step 3] YY;|+⟩ → δθ  (rotation error)")
+    f_YY = db_simulate_sequence(gates["YY"], rho_p, num_reps, t_g, T_1, T_2, shots)
+    fit_YY = fit_db_sequence(times, f_YY, fix_omega=False, label="YY")
+    delta_theta_fit = 2 * fit_YY["omega"] * t_g
+    print(f"           ω     = {fit_YY['omega']:.2f} rad/s  →  "
+          f"δθ fit = {np.degrees(delta_theta_fit):.4f}°  "
+          f"(input {np.degrees(d_theta):.4f}°)")
+    
+    print("  [Step 4] X̄X;|+⟩ → δφ  (phase error)")
+    f_XXbar = db_simulate_sequence(gates["XXd"], rho_p, num_reps, t_g, T_1, T_2, shots)
+    omega_prior = d_phi / (2 * t_g)   # use input δφ as warm-start (physical prior)
+    fit_XXbar = fit_db_sequence(times, f_XXbar, fix_omega=False,
+                                omega_predict = omega_prior, label="XXbar")
+    delta_phi_fit = fit_XXbar["omega"] * 2 * t_g 
+    print(f"           ω     = {fit_XXbar['omega']:.2f} rad/s  →  "
+          f"δφ fit = {np.degrees(delta_phi_fit):.4f}°  "
+          f"(input {np.degrees(d_phi):.4f}°)")
+    
+    params = db_extract(fit_t1, fit_XX, fit_YY, fit_XXbar, t_g)
+    print()
+    print("  ── Extracted Parameters ──────────────────────────────────")
+    print(f"  T1   = {params['T1'] * 1e6:.2f} µs")
+    print(f"  T2   = {params['T2'] * 1e6:.2f} µs")
+    print(f"  Tφ   = {params['Tphi'] * 1e6:.2f} µs  (pure dephasing)")
+    print(f"  δθ   = {np.degrees(params['delta_theta']):.4f}°")
+    print(f"  δφ   = {np.degrees(params['delta_phi']):.4f}°")
+
+    print()
+    print("  [Test 1] ȲY and YȲ on |+⟩  (T1 asymmetry probe)")
+    f_YYdY = db_simulate_sequence(gates["YYdY"], rho_p, num_reps, t_g, T_1, T_2, shots)
+    f_YYd = db_simulate_sequence(gates["YYd"], rho_p, num_reps, t_g, T_1, T_2, shots)
+    print(f"           ȲY saturation  ≈ {f_YYdY[-10:].mean():.4f}  "
+          f"(excited hemisphere, decays faster)")
+    print(f"           YȲ saturation  ≈ {f_YYd[-10:].mean():.4f}  "
+          f"(ground hemisphere,  decays slower)")
+    
+    return dict(
+        times      = times,
+        t1_times   = t1_times,
+        f_T1       = f_T1,
+        f_XX       = f_XX,
+        f_YY       = f_YY,
+        f_XXbar    = f_XXbar,
+        f_YYbar    = f_YYdY,
+        f_YbarY    = f_YYd,
+        fit_t1     = fit_t1,
+        fit_XX     = fit_XX,
+        fit_YY     = fit_YY,
+        fit_XXbar  = fit_XXbar,
+        params     = params,
+        shots      = shots,
+        # Input truth values for comparison
+        truth      = dict(T1=T_1, T2=T_2, delta_theta=d_theta,
+                          delta_phi=d_phi, tg=t_g)
+    )
+
+    
 #Visualizations
 def plot_rb(lengths, p_avg, p_std, popt, r_C, e_max, save_path = None):
     A, p, B = popt
@@ -477,6 +785,306 @@ def plot_irb_single(lengths, p_avg_rb, p_std_rb, popt_rb,
         print(f"\nPlot saved to {save_path}")
     plt.show()
 
+def plot_db(db_results: dict, save_path: str = None):
+    times = db_results["times"]
+    T_1_times = db_results["t1_times"]
+    params = db_results["params"]
+    truth = db_results["truth"]
+    t_g = truth["tg"]
+
+    fit_T_1 = db_results["fit_t1"]
+    fit_XX = db_results["fit_XX"]
+    fit_YY = db_results["fit_YY"]
+    fit_XXd = db_results["fit_XXbar"]
+
+    T_us = times * 1e6
+    T_1_us = T_1_times * 1e6
+
+    T_fine = np.linspace(times[0], times[-1], 1000)
+    T_1_fine = np.linspace(T_1_times[0], T_1_times[-1], 1000)
+    T_us_fine = T_fine * 1e6
+    T_1_us_fine = T_1_fine * 1e6
+
+    def curve_T_1(t):
+        return db_fidelity(t, fit_T_1["a"], fit_T_1["T_D"], 0.0)
+
+    def curve_XX(t):
+        return db_fidelity(t, fit_XX["a"], fit_XX["T_D"], 0.0)
+    
+    def curve_YY(t):
+        return db_fidelity(t, fit_YY["a"], fit_YY["T_D"], fit_YY["omega"])
+    
+    def curve_XXd(t):
+        return db_fidelity(t, fit_XXd["a"], fit_XXd["T_D"], fit_XXd["omega"])
+    
+    fig, axes = plt.subplots(2, 3, figsize = (10, 10))
+    fig.patch.set_facecolor("blue")
+    for ax in axes.flat:
+        ax.set_facecolor("red")
+        ax.tick_params(colors = "white")
+        ax.xaxis.label.set_color("white")
+        ax.yaxis.label.set_color("white")
+        ax.title.set_color("white")
+        for spine in ax.spines.values():
+            spine.set_edgecolor("purple")
+        ax.grid(True, linestyle = "--", color = "purple", alpha = 0.7)
+        ax.set_ylim(-0.05, 1.05)
+    
+    marker_kw = dict(fmt = "o", markersize = 3.5, elinewidth = 0.7, capsize = 2.5, capthick = 0.7, alpha = 0.85)
+
+    ax = axes[0, 0]
+    ax.plot(T_1_us, db_results["f_T1"], "o", color = "red", markersize = 3.5, alpha = 0.8, label = "Free; |1> (data)")
+    ax.plot(T_1_us_fine, curve_T_1(T_1_fine), color="#ff9999", lw=1.8,
+            label=f"Fit  T₁ = {params['T1']*1e6:.2f} µs")
+    ax.axhline(0.5, color="#888899", lw=0.8, ls=":")
+    ax.set_xlabel("Evolution time (µs)")
+    ax.set_ylabel("Fidelity F̃")
+    ax.set_title(f"Step 1 — T₁ Measurement\nT₁ = {params['T1']*1e6:.2f} µs  "
+                 f"[truth {truth['T1']*1e6:.2f} µs]")
+    ax.legend(facecolor="#1a1a33", edgecolor="#555577",
+              labelcolor="white", fontsize=8)
+    
+    ax = axes[0, 1]
+    ax.plot(T_us, db_results["f_XX"], "o", color="#4ecdc4",
+            markersize=3.5, alpha=0.8, label="XX;|+⟩ (data)")
+    ax.plot(T_us_fine, curve_XX(T_fine), color="#80eeea", lw=1.8,
+            label=f"Fit  T₂ = {params['T2']*1e6:.2f} µs")
+    ax.axhline(0.5, color="#888899", lw=0.8, ls=":")
+    ax.set_xlabel("Evolution time (µs)")
+    ax.set_title(f"Step 2 — T₂ via XX;|+⟩\nT₂ = {params['T2']*1e6:.2f} µs  "
+                 f"[truth {truth['T2']*1e6:.2f} µs]")
+    ax.legend(facecolor="#1a1a33", edgecolor="#555577",
+              labelcolor="white", fontsize=8)
+    
+    ax = axes[0, 2]
+    ax.plot(T_us, db_results["f_YY"], "o", color="#f7dc6f",
+            markersize=3.5, alpha=0.8, label="YY;|+⟩ (data)")
+    ax.plot(T_us_fine, curve_YY(T_fine), color="#fde98d", lw=1.8,
+            label=f"Fit  δθ = {np.degrees(params['delta_theta']):.4f}°")
+    ax.set_xlabel("Evolution time (µs)")
+    ax.set_title(f"Step 3 — δθ via YY;|+⟩\n"
+                 f"δθ = {np.degrees(params['delta_theta']):.4f}°  "
+                 f"[truth {np.degrees(truth['delta_theta']):.4f}°]")
+    ax.legend(facecolor="#1a1a33", edgecolor="#555577",
+              labelcolor="white", fontsize=8)
+    
+    ax = axes[1, 0]
+    ax.plot(T_us, db_results["f_XXbar"], "o", color="#bb8fce",
+            markersize=3.5, alpha=0.8, label="X̄X;|+⟩ (data)")
+    ax.plot(T_us_fine, curve_XXd(T_fine), color="#d2b4de", lw=1.8,
+            label=f"Fit  δφ = {np.degrees(params['delta_phi']):.4f}°")
+    ax.set_xlabel("Evolution time (µs)")
+    ax.set_ylabel("Fidelity F̃")
+    ax.set_title(f"Step 4 — δφ via X̄X;|+⟩\n"
+                 f"δφ = {np.degrees(params['delta_phi']):.4f}°  "
+                 f"[truth {np.degrees(truth['delta_phi']):.4f}°]")
+    ax.legend(facecolor="#1a1a33", edgecolor="#555577",
+              labelcolor="white", fontsize=8)
+    
+    ax = axes[1, 1]
+    ax.plot(T_us, db_results["f_YYbar"], "o", color="#e74c3c",
+            markersize=3.5, alpha=0.8, label="ȲY;|+⟩  (excited ↓ faster)")
+    ax.plot(T_us, db_results["f_YbarY"], "s", color="#2ecc71",
+            markersize=3.5, alpha=0.8, label="YȲ;|+⟩  (ground ↓ slower)")
+    ax.axhline(0.5, color="#888899", lw=0.8, ls=":")
+    ax.set_xlabel("Evolution time (µs)")
+    ax.set_title("Test 1 — T₁ Asymmetry\nȲY vs YȲ on |+⟩")
+    ax.legend(facecolor="#1a1a33", edgecolor="#555577",
+              labelcolor="white", fontsize=8)
+    
+    ax = axes[1, 2]
+    ax.axis("off")
+    table_data = [
+        ["Parameter", "Extracted", "Input (truth)", "Error"],
+        ["T₁ (µs)",
+         f"{params['T1']*1e6:.3f}",
+         f"{truth['T1']*1e6:.3f}",
+         f"{(params['T1']-truth['T1'])/truth['T1']*100:+.2f}%"],
+        ["T₂ (µs)",
+         f"{params['T2']*1e6:.3f}",
+         f"{truth['T2']*1e6:.3f}",
+         f"{(params['T2']-truth['T2'])/truth['T2']*100:+.2f}%"],
+        ["Tφ (µs)",
+         f"{params['Tphi']*1e6:.3f}", "—", "—"],
+        ["δθ (°)",
+         f"{np.degrees(params['delta_theta']):.4f}",
+         f"{np.degrees(truth['delta_theta']):.4f}",
+         f"{(params['delta_theta']-truth['delta_theta'])/truth['delta_theta']*100:+.2f}%"],
+        ["δφ (°)",
+         f"{np.degrees(params['delta_phi']):.4f}",
+         f"{np.degrees(truth['delta_phi']):.4f}",
+         f"{(params['delta_phi']-truth['delta_phi'])/truth['delta_phi']*100:+.2f}%"],
+    ]
+
+    col_colors = [["#1a2a4a"] * 4]
+    cell_colors = [["#1a2a4a"] * 4] + [["#111128"] * 4] * (len(table_data) - 1)
+ 
+    table = ax.table(cellText=table_data[1:],
+                     colLabels=table_data[0],
+                     loc="center",
+                     cellLoc="center",
+                     cellColours=cell_colors[1:],
+                     colColours=["#1a2a4a"] * 4)
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1.1, 1.8)
+    for (r, c), cell in table.get_celld().items():
+        cell.set_edgecolor("#444466")
+        cell.get_text().set_color("white")
+    
+    ax.set_title("DB Extracted vs Truth", color="white", fontsize=10, pad=12)
+
+    n_shots_used = db_results.get("shots", DB_shots)
+    fig.suptitle(
+        "Deterministic Benchmarking  —  Tripathi et al. 2025 §4\n"
+        f"t_g = {truth['tg']*1e9:.0f} ns  |  shots = {n_shots_used}",
+        color="white", fontsize=13, y=1.01)
+ 
+    plt.tight_layout()
+ 
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight",
+                    facecolor=fig.get_facecolor())
+        print(f"\nDB plot saved to {save_path}")
+    plt.show()
+
+def plot_db_figure6(db_results: dict, save_path: str = None):
+    truth   = db_results["truth"]
+    params  = db_results["params"]
+    times   = db_results["times"]       # 2·n·tg  for gate sequences
+    t1_times = db_results["t1_times"]   # n·tg    for free evolution
+ 
+    T_1  = params["T1"]
+    T_2  = params["T2"]
+    t_g  = truth["tg"]
+    d_theta = truth["delta_theta"]
+    d_phi   = truth["delta_phi"]
+ 
+    fit_t1    = db_results["fit_t1"]
+    fit_XX    = db_results["fit_XX"]
+    fit_YY    = db_results["fit_YY"]
+    fit_XXbar = db_results["fit_XXbar"]
+ 
+    T1_fine   = np.linspace(t1_times[0], t1_times[-1], 800)
+    T_fine    = np.linspace(times[0],    times[-1],    800)
+    T1_us_fine = T1_fine * 1e6
+    T_us_fine  = T_fine  * 1e6
+    T1_us      = t1_times * 1e6
+    T_us       = times    * 1e6
+ 
+    def analytic(t, fit):
+        return db_fidelity(t, fit["a"], fit["T_D"], fit["omega"])
+ 
+    curve_T1    = analytic(T1_fine,  fit_t1)
+    curve_XX    = analytic(T_fine,   fit_XX)
+    curve_YY    = analytic(T_fine,   fit_YY)
+    curve_XXbar = analytic(T_fine,   fit_XXbar)
+ 
+    gates = db_gates_construct(d_theta, d_phi)
+ 
+    E_free = free_evol_prop(t_g, T_1, T_2)
+    lind_T1 = compute_lindblad_fidelity(t1_times, [E_free], rho_1, rho_1)
+ 
+    def lind_seq(key, rho_in, meas):
+        U1, U2 = gates[key]
+        E1 = gate_propagator(U1, t_g, T_1, T_2)
+        E2 = gate_propagator(U2, t_g, T_1, T_2)
+        return compute_lindblad_fidelity(times, [E1, E2], rho_in, meas)
+ 
+    lind_XX    = lind_seq("XX",   rho_p, rho_p)
+    lind_YY    = lind_seq("YY",   rho_p, rho_p)
+    lind_XXbar = lind_seq("XXd",  rho_p, rho_p)
+    lind_YYbar = lind_seq("YYdY", rho_p, rho_p)   # ȲY  (excited hem.)
+    lind_YbarY = lind_seq("YYd",  rho_p, rho_p)   # YȲ  (ground hem.)
+ 
+    seq_styles = [
+        # (label,            x_us,   data,                  color,     marker,
+        #  analytic_x,       analytic_y,    lind_x,    lind_y)
+        ("Free; |1⟩",        T1_us,  db_results["f_T1"],   "#4dffb4", "o",
+         T1_us_fine, curve_T1,    T1_us, lind_T1),
+        ("XX; |+⟩",          T_us,   db_results["f_XX"],   "#4dc3ff", "^",
+         T_us_fine,  curve_XX,    T_us,  lind_XX),
+        ("YY; |+⟩",          T_us,   db_results["f_YY"],   "#ffd700", "v",
+         T_us_fine,  curve_YY,    T_us,  lind_YY),
+        ("X̄X; |+⟩",         T_us,   db_results["f_XXbar"],"#ff7043", "s",
+         T_us_fine,  curve_XXbar, T_us,  lind_XXbar),
+        ("ȲY; |+⟩",          T_us,   db_results["f_YYbar"],"#ce93d8", "D",
+         T_us,       db_results["f_YYbar"], T_us, lind_YYbar),
+        ("YȲ; |+⟩",          T_us,   db_results["f_YbarY"],"#a5d6a7", "P",
+         T_us,       db_results["f_YbarY"], T_us, lind_YbarY),
+    ]
+ 
+    fig, ax = plt.subplots(figsize=(10, 6))
+    fig.patch.set_facecolor("#0d1117")
+    ax.set_facecolor("#0d1117")
+ 
+    first_data = True   # for legend grouping headers (proxy artists)
+    for (label, x_d, data, color, mkr,
+         x_a,   a_curve, x_l, l_curve) in seq_styles:
+ 
+        # empirical data – symbols
+        ax.plot(x_d, data, mkr,
+                color=color, markersize=4, alpha=0.85,
+                markeredgewidth=0.3, markeredgecolor="white",
+                label=label, zorder=4)
+ 
+        # analytical fit – solid line
+        ax.plot(x_a, a_curve, "-",
+                color=color, linewidth=1.6, alpha=0.9, zorder=3)
+ 
+        # Lindblad numerical – dashed line
+        ax.plot(x_l, l_curve, "--",
+                color=color, linewidth=1.3, alpha=0.75, zorder=2)
+ 
+    from matplotlib.lines import Line2D
+    proxy_data   = Line2D([0],[0], ls="none",  marker="o", color="white",
+                          markersize=5, label="Simulated data (symbols)")
+    proxy_fit    = Line2D([0],[0], ls="-",    color="white", lw=1.6,
+                          label="Analytical fit  (solid)")
+    proxy_lind   = Line2D([0],[0], ls="--",   color="white", lw=1.3,
+                          label="Lindblad model (dashed)")
+ 
+    # collect sequence legend handles then append style proxies
+    seq_handles, seq_labels = ax.get_legend_handles_labels()
+    all_handles = seq_handles + [proxy_data, proxy_fit, proxy_lind]
+    all_labels  = seq_labels  + ["Simulated data (symbols)",
+                                  "Analytical fit  (solid)",
+                                  "Lindblad model (dashed)"]
+ 
+    leg = ax.legend(all_handles, all_labels,
+                    ncol=2, fontsize=8,
+                    facecolor="#1c2230", edgecolor="#444466",
+                    labelcolor="white",
+                    loc="upper right")
+ 
+    ax.set_xlabel("Evolution time (µs)", color="white", fontsize=12)
+    ax.set_ylabel("Fidelity  F̃", color="white", fontsize=12)
+    ax.set_title(
+        "Deterministic Benchmarking — Figure 6 overlay\n"
+        f"T₁ = {T_1*1e6:.2f} µs · T₂ = {T_2*1e6:.2f} µs · "
+        f"δθ = {np.degrees(d_theta):.3f}° · δφ = {np.degrees(d_phi):.3f}°",
+        color="white", fontsize=11, pad=10
+    )
+    ax.set_ylim(-0.02, 1.05)
+    ax.set_xlim(left=0)
+    ax.tick_params(colors="white", labelsize=9)
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#444466")
+    ax.grid(True, linestyle="--", color="#2a3550", alpha=0.8)
+ 
+    plt.tight_layout()
+ 
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight",
+                    facecolor=fig.get_facecolor())
+        print(f"\nFigure-6 overlay saved to {save_path}")
+ 
+    plt.show()
+ 
+ 
+
+
+
 def main():
     print("Single-Qubit Randomized Benchmarking")
     print(f"Clifford Group Size: {NUM_CLIFFORDS}")
@@ -549,6 +1157,19 @@ def main():
                         lengths_irb, p_avg_irb, p_std_irb, popt_irb,
                         r_C, r_gate, TARGET_GATE_NAME, e_max,
                         save_path=f"irb_{TARGET_GATE_NAME}.png")
+
+        db_results = run_db(
+        T_1          = DB_T1,
+        T_2          = DB_T2,
+        t_g          = DB_gate_time,
+        d_theta = DB_d_theta,
+        d_phi   = DB_d_phi,
+        num_reps      = DB_Num_repeats,
+        shots       = DB_shots,
+    )
+    plot_db(db_results, save_path="db_results.png")
+
+    plot_db_figure6(db_results, save_path="db_figure6.png")
 
 #Run Main
 if __name__ == "__main__":
