@@ -11,9 +11,9 @@ SEED = 42
 rng = np.random.default_rng(SEED)
 
 #Global Parameters
-N_max = 100
-K = 100
-K_IRB = 200  # more sequences for IRB to tighten the bound
+N_max = 256
+K = 32
+K_IRB = 64  # more sequences for IRB to tighten the bound
 e_max = 0.05
 N_shots = 1024
 mu = 0.005
@@ -24,16 +24,35 @@ sigma = 0.001
 # Physically motivated: pi gates noisier than pi/2, virtual gates near-zero
 # Tripathi Section 4.4 notes ~80% pi/2 and ~20% pi in a typical Clifford set
 GATE_NOISE_TABLE = {
-    "I":   (0.001, 0.0002),   # virtual — essentially free
-    "X":   (0.015, 0.002),    # pi pulse
-    "Y":   (0.015, 0.002),    # pi pulse
-    "Z":   (0.001, 0.0002),   # virtual gate
-    "H":   (0.008, 0.001),    # pi/2 + pi/2 decomposition
-    "S":   (0.006, 0.001),    # pi/2 pulse
-    "Sd":  (0.006, 0.001),    # pi/2 pulse
+    "I":        (0.0010, 0.0002),  # no pulse
+    "X":        (0.0150, 0.0020),  # 1x pi
+    "Y":        (0.0150, 0.0020),  # 1x pi
+    "Z":        (0.0267, 0.0024),  # 2x pi/2 + 1x pi
+    "H":        (0.0209, 0.0022),  # 1x pi/2 + 1x pi
+    "S":        (0.0179, 0.0017),  # 3x pi/2
+    "Sd":       (0.0179, 0.0017),  # 3x pi/2
+    # Group A — 1x pi/2
+    "+X+Z-Y":   (0.0060, 0.0010),
+    "+Z+Y-X":   (0.0060, 0.0010),
+    "+X-Z+Y":   (0.0060, 0.0010),
+    "-Z+Y+X":   (0.0060, 0.0010),
+    # Group B — 2x pi/2
+    "+Z+X+Y":   (0.0120, 0.0014),
+    "+Z-X-Y":   (0.0120, 0.0014),
+    "-Y-Z+X":   (0.0120, 0.0014),
+    "+Y+Z+X":   (0.0120, 0.0014),
+    "-Y+Z-X":   (0.0120, 0.0014),
+    "+Y-Z-X":   (0.0120, 0.0014),
+    "-Z-X+Y":   (0.0120, 0.0014),
+    "-Z+X-Y":   (0.0120, 0.0014),
+    # Group C — 3x pi/2 (same noise as S/Sd)
+    "+Y+X-Z":   (0.0179, 0.0017),
+    "-Y-X-Z":   (0.0179, 0.0017),
+    # Group D — pi/2 + pi (same noise as H)
+    "-X-Z-Y":   (0.0209, 0.0022),
+    "-X+Z+Y":   (0.0209, 0.0022),
+    "-Z-Y-X":   (0.0209, 0.0022),
 }
-GATE_NOISE_DEFAULT_MU    = 0.010  # for remaining 17 Cliffords (multi-pulse)
-GATE_NOISE_DEFAULT_SIGMA = 0.002
 
 # DB Parameters (from Tripathi Paper)
 DB_gate_time = 88e-9
@@ -221,9 +240,12 @@ def irb_sequence(n, e_max, rho_in, target_gate):
     gate_sequence = []
 
     target_label = clifford_names(target_gate)
-    target_mu, target_sigma = GATE_NOISE_TABLE.get(
-        target_label, (GATE_NOISE_DEFAULT_MU, GATE_NOISE_DEFAULT_SIGMA)
-    )
+    if target_label not in GATE_NOISE_TABLE:
+        raise ValueError(
+            f"Target gate '{target_label}' has no entry in GATE_NOISE_TABLE. "
+            f"All 24 Clifford labels must be present."
+        )
+    target_mu, target_sigma = GATE_NOISE_TABLE[target_label]
 
     for _ in range(n):
         # Random Clifford — same gate-independent noise as standard RB
@@ -1086,6 +1108,11 @@ def plot_db_figure6(db_results: dict, save_path: str = None):
 
 
 def main():
+    for gate in CLIFFORD_SET:
+        label = clifford_names(gate)
+        assert label in GATE_NOISE_TABLE, (
+            f"Clifford label '{label}' missing from GATE_NOISE_TABLE"
+        )
     print("Single-Qubit Randomized Benchmarking")
     print(f"Clifford Group Size: {NUM_CLIFFORDS}")
     print(f"Initial State: |0>")
@@ -1113,64 +1140,80 @@ def main():
     plot_rb(lengths, p_avg, p_std, popt_rb, r_C, e_max,
             save_path="rb_single_qubit.png")
 
-# --- Interleaved RB: user-selected target gate ---
-    # Choose from any gate name in CLIFFORD_LABEL_SET, e.g.:
-    # "I", "X", "Y", "Z", "H", "S", "Sd"
-    # or signature names like "+X+Z-Y", "-Y+Z-X", etc.
-    # Run print(set(CLIFFORD_LABEL_SET.values())) to see all 24 names
-    TARGET_GATE_NAME = "X"
-
-    # Resolve name to matrix
+# --- Build name→matrix lookup once, used for all IRB targets ---
     name_to_mat = {}
     for gate in CLIFFORD_SET:
         label = CLIFFORD_LABEL_SET[matrix_key(gate)]
         name_to_mat[label] = gate
-    if TARGET_GATE_NAME not in name_to_mat:
-        print(f"\nUnknown gate '{TARGET_GATE_NAME}'. Available gates:")
-        print(sorted(set(CLIFFORD_LABEL_SET.values())))
-    else:
-        target_gate = name_to_mat[TARGET_GATE_NAME]
-        print(f"\n--- Interleaved RB (target gate: {TARGET_GATE_NAME}) ---")
 
-        lengths_irb, p_avg_irb, p_std_irb, irb_sequence_record = collect_irb_data(N_max, K_IRB, e_max, rho_0, target_gate)
-        export_gate_sequences(irb_sequence_record, IRB_CSV_path)
-        
+    # --- Interleaved RB: run for each of the 5 target gates ---
+    # sqrt(Y) = Ry(pi/2) has Pauli-signature label "-Z+Y+X" in this basis
+    IRB_TARGETS = ["X", "H", "S", "Z", "-Z+Y+X"]
+    IRB_LABELS  = ["X", "H", "S", "Z", "SqrtY"]   # human-readable for filenames/plots
+
+    irb_results = {}   # store per-gate results for any downstream use
+
+    for TARGET_GATE_NAME, TARGET_DISPLAY in zip(IRB_TARGETS, IRB_LABELS):
+        if TARGET_GATE_NAME not in name_to_mat:
+            print(f"\n[IRB] Unknown gate '{TARGET_GATE_NAME}' — skipping.")
+            continue
+
+        target_gate = name_to_mat[TARGET_GATE_NAME]
+        print(f"\n--- Interleaved RB (target gate: {TARGET_DISPLAY} / '{TARGET_GATE_NAME}') ---")
+
+        lengths_irb, p_avg_irb, p_std_irb, irb_sequence_record = collect_irb_data(
+            N_max, K_IRB, e_max, rho_0, target_gate
+        )
+        export_gate_sequences(
+            irb_sequence_record,
+            f"irb_sequences_{TARGET_DISPLAY}.csv"
+        )
+
         popt_irb, pcov_irb = fit_rb_func(lengths_irb, p_avg_irb, p_std_irb)
         A_irb, p_irb, B_irb = popt_irb
         perr_irb = (np.sqrt(np.diag(pcov_irb))
                     if not np.any(np.isnan(pcov_irb))
-                    else [np.nan]*3)
+                    else [np.nan] * 3)
 
-        r_gate = irb_gate_infidelity(p_rb, p_irb)
-        E = irb_error_bound(p_rb, p_irb)
+        r_gate     = irb_gate_infidelity(p_rb, p_irb)
+        E          = irb_error_bound(p_rb, p_irb)
         r_gate_err = perr_irb[1] / (2 * p_rb)
 
         print(f"p_inter = {p_irb:.5f} +- {perr_irb[1]:.5f}")
-        print(f"r_G     = {r_gate*100:.4f}% +- {r_gate_err*100:.4f}%")
+        print(f"r_G     = {r_gate * 100:.4f}% +- {r_gate_err * 100:.4f}%")
         r_G_lower = max(r_gate - E, 0.0)
         r_G_upper = min(r_gate + E, 1.0)
         flag = " [lower bound clamped]" if r_gate <= E else ""
-        print(f"E bound = {E*100:.4f}%  =>  "
-              f"r_G in [{r_G_lower*100:.4f}%, {r_G_upper*100:.4f}%]{flag}")
+        print(f"E bound = {E * 100:.4f}%  =>  "
+              f"r_G in [{r_G_lower * 100:.4f}%, {r_G_upper * 100:.4f}%]{flag}")
 
-        plot_irb_single(lengths, p_avg, p_std, popt_rb,
-                        lengths_irb, p_avg_irb, p_std_irb, popt_irb,
-                        r_C, r_gate, TARGET_GATE_NAME, e_max,
-                        save_path=f"irb_{TARGET_GATE_NAME}.png")
+        plot_irb_single(
+            lengths,     p_avg,     p_std,     popt_rb,
+            lengths_irb, p_avg_irb, p_std_irb, popt_irb,
+            r_C, r_gate, TARGET_DISPLAY, e_max,
+            save_path=f"irb_{TARGET_DISPLAY}.png"
+        )
 
-        db_results = run_db(
-        T_1          = DB_T1,
-        T_2          = DB_T2,
-        t_g          = DB_gate_time,
-        d_theta = DB_d_theta,
-        d_phi   = DB_d_phi,
-        num_reps      = DB_Num_repeats,
-        shots       = DB_shots,
+        irb_results[TARGET_DISPLAY] = dict(
+            p_inter   = p_irb,
+            r_gate    = r_gate,
+            r_gate_err= r_gate_err,
+            E         = E,
+        )
+
+    # --- Deterministic Benchmarking (runs once, independent of IRB) ---
+    db_results = run_db(
+        T_1      = DB_T1,
+        T_2      = DB_T2,
+        t_g      = DB_gate_time,
+        d_theta  = DB_d_theta,
+        d_phi    = DB_d_phi,
+        num_reps = DB_Num_repeats,
+        shots    = DB_shots,
     )
     plot_db(db_results, save_path="db_results.png")
-
     plot_db_figure6(db_results, save_path="db_figure6.png")
-
+    
 #Run Main
 if __name__ == "__main__":
     main()
